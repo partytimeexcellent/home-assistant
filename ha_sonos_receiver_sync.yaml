@@ -1,5 +1,5 @@
 blueprint:
-  name: Sonos Connect Sync v2
+  name: Sonos Receiver Sync
   description: >
     Keeps a Sonos Connect and the receiver it feeds in sync.
 
