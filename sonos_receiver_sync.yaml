@@ -1,0 +1,285 @@
+blueprint:
+  name: Sonos Connect Sync v2
+  description: >
+    Keeps a Sonos Connect and the receiver it feeds in sync.
+
+    - Turns the receiver on and selects the Sonos input when the Sonos starts playing.
+
+    - Optionally mirrors volume between the Sonos and the receiver.
+
+    - Turns the receiver off after the Sonos has stopped for a while, if it is still
+    on the Sonos input.
+
+    - Pauses the Sonos if you switch the receiver to a different input.
+
+    Updated for current Home Assistant syntax. Source names are case-sensitive, so
+    the receiver source must match an entry in the receiver's source_list exactly.
+  domain: automation
+  homeassistant:
+    min_version: 2024.10.0
+  input:
+    sonos_connect:
+      name: Sonos
+      description: The Sonos Connect media player.
+      selector:
+        entity:
+          filter:
+            - integration: sonos
+              domain: media_player
+          multiple: false
+    receiver:
+      name: Receiver
+      description: The receiver media player the Sonos is connected to.
+      selector:
+        entity:
+          filter:
+            - domain: media_player
+          multiple: false
+    receiver_source:
+      name: Receiver source name
+      description: >
+        Exact (case-sensitive) name of the receiver input the Sonos is connected to,
+        as listed in the receiver's source_list attribute.
+      default: SONOS
+      selector:
+        text:
+    turn_off_delay:
+      name: Receiver turn off delay
+      description: How long the Sonos must be stopped before the receiver turns off.
+      default: 300
+      selector:
+        number:
+          min: 0
+          max: 3600
+          unit_of_measurement: seconds
+          step: 1
+          mode: slider
+    power_on_settle_time:
+      name: Receiver power-on settle time
+      description: >
+        Extra time to wait after the receiver reports it is on, before selecting the
+        source. Increase this if the source selection is ignored right after power-on.
+      default: 3
+      selector:
+        number:
+          min: 0
+          max: 30
+          unit_of_measurement: seconds
+          step: 1
+          mode: slider
+    power_on_timeout:
+      name: Receiver power-on timeout
+      description: Maximum time to wait for the receiver to report that it is on.
+      default: 30
+      selector:
+        number:
+          min: 5
+          max: 120
+          unit_of_measurement: seconds
+          step: 1
+          mode: slider
+    sync_volume:
+      name: Synchronise volume
+      description: Mirror volume changes between the Sonos and the receiver.
+      default: true
+      selector:
+        boolean:
+    sync_volume_buffer_time:
+      name: Volume sync buffer time
+      description: >
+        How long a volume change must hold steady before it is copied to the other
+        device.
+      default: 1000
+      selector:
+        number:
+          min: 500
+          max: 3000
+          unit_of_measurement: milliseconds
+          step: 1
+          mode: slider
+    volume_tolerance:
+      name: Volume tolerance
+      description: >
+        Volume differences smaller than this are ignored. Prevents the two devices
+        from bouncing volume back and forth because of rounding. 0.02 is 2%.
+      default: 0.02
+      selector:
+        number:
+          min: 0
+          max: 0.1
+          step: 0.01
+          mode: box
+
+mode: queued
+max: 10
+max_exceeded: silent
+
+variables:
+  sonos: !input sonos_connect
+  receiver: !input receiver
+  target_source: !input receiver_source
+  sync_volume: !input sync_volume
+  tolerance: !input volume_tolerance
+  settle_time: !input power_on_settle_time
+  power_on_timeout: !input power_on_timeout
+
+triggers:
+  - trigger: state
+    entity_id: !input sonos_connect
+    to: playing
+    id: sonos_playing
+  - trigger: state
+    entity_id: !input sonos_connect
+    from: playing
+    for:
+      seconds: !input turn_off_delay
+    id: sonos_stopped
+  - trigger: state
+    entity_id: !input receiver
+    attribute: source
+    from: !input receiver_source
+    id: receiver_source_left
+  - trigger: state
+    entity_id: !input sonos_connect
+    attribute: volume_level
+    for:
+      milliseconds: !input sync_volume_buffer_time
+    id: sonos_volume
+  - trigger: state
+    entity_id: !input receiver
+    attribute: volume_level
+    for:
+      milliseconds: !input sync_volume_buffer_time
+    id: receiver_volume
+
+actions:
+  - choose:
+      # Sonos started playing: power on the receiver, select the Sonos input, match volume.
+      - alias: Power on receiver and select Sonos input
+        conditions:
+          - condition: trigger
+            id: sonos_playing
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ states(receiver) in ['off', 'standby', 'unknown'] }}"
+            then:
+              - action: media_player.turn_on
+                target:
+                  entity_id: !input receiver
+              - wait_template: >
+                  {{ states(receiver) not in ['off', 'standby', 'unknown', 'unavailable'] }}
+                timeout:
+                  seconds: "{{ power_on_timeout }}"
+                continue_on_timeout: true
+              - delay:
+                  seconds: "{{ settle_time }}"
+          - if:
+              - condition: template
+                value_template: >
+                  {{ states(receiver) not in ['off', 'unavailable', 'unknown']
+                     and state_attr(receiver, 'source') != target_source }}
+            then:
+              - action: media_player.select_source
+                target:
+                  entity_id: !input receiver
+                data:
+                  source: !input receiver_source
+          - if:
+              - condition: template
+                value_template: "{{ sync_volume }}"
+              - condition: template
+                value_template: >
+                  {{ state_attr(sonos, 'volume_level') is number }}
+            then:
+              - delay:
+                  milliseconds: !input sync_volume_buffer_time
+              - if:
+                  - condition: template
+                    value_template: >
+                      {{ states(receiver) not in ['off', 'unavailable', 'unknown'] }}
+                then:
+                  - action: media_player.volume_set
+                    target:
+                      entity_id: !input receiver
+                    data:
+                      volume_level: "{{ state_attr(sonos, 'volume_level') | float(0) }}"
+
+      # Sonos has been stopped long enough: turn the receiver off if it is still on the Sonos input.
+      - alias: Turn off receiver
+        conditions:
+          - condition: trigger
+            id: sonos_stopped
+          - condition: template
+            value_template: "{{ not is_state(sonos, 'playing') }}"
+          - condition: template
+            value_template: >
+              {{ states(receiver) not in ['off', 'unavailable', 'unknown']
+                 and state_attr(receiver, 'source') == target_source }}
+        sequence:
+          - action: media_player.turn_off
+            target:
+              entity_id: !input receiver
+
+      # Receiver was switched away from the Sonos input while the Sonos is playing: pause it.
+      - alias: Pause Sonos when receiver leaves the Sonos input
+        conditions:
+          - condition: trigger
+            id: receiver_source_left
+          - condition: template
+            value_template: >
+              {{ states(receiver) not in ['off', 'unavailable', 'unknown'] }}
+          - condition: template
+            value_template: "{{ is_state(sonos, 'playing') }}"
+        sequence:
+          - action: media_player.media_pause
+            target:
+              entity_id: !input sonos_connect
+
+      # Sonos volume changed: copy to the receiver.
+      - alias: Sonos volume to receiver
+        conditions:
+          - condition: trigger
+            id: sonos_volume
+          - condition: template
+            value_template: "{{ sync_volume }}"
+          - condition: template
+            value_template: >
+              {{ states(receiver) not in ['off', 'unavailable', 'unknown']
+                 and state_attr(receiver, 'source') == target_source }}
+          - condition: template
+            value_template: >
+              {{ state_attr(sonos, 'volume_level') is number
+                 and state_attr(receiver, 'volume_level') is number
+                 and (state_attr(sonos, 'volume_level') | float(0)
+                      - state_attr(receiver, 'volume_level') | float(0)) | abs > tolerance | float(0) }}
+        sequence:
+          - action: media_player.volume_set
+            target:
+              entity_id: !input receiver
+            data:
+              volume_level: "{{ state_attr(sonos, 'volume_level') | float(0) }}"
+
+      # Receiver volume changed: copy to the Sonos.
+      - alias: Receiver volume to Sonos
+        conditions:
+          - condition: trigger
+            id: receiver_volume
+          - condition: template
+            value_template: "{{ sync_volume }}"
+          - condition: template
+            value_template: >
+              {{ states(receiver) not in ['off', 'unavailable', 'unknown']
+                 and state_attr(receiver, 'source') == target_source }}
+          - condition: template
+            value_template: >
+              {{ state_attr(sonos, 'volume_level') is number
+                 and state_attr(receiver, 'volume_level') is number
+                 and (state_attr(sonos, 'volume_level') | float(0)
+                      - state_attr(receiver, 'volume_level') | float(0)) | abs > tolerance | float(0) }}
+        sequence:
+          - action: media_player.volume_set
+            target:
+              entity_id: !input sonos_connect
+            data:
+              volume_level: "{{ state_attr(receiver, 'volume_level') | float(0) }}"
